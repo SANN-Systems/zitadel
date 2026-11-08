@@ -20,26 +20,8 @@ import (
 // TestSannP4GuardLatency measures the guard against a real, disposable Postgres with the upstream
 // events2 schema. It never runs in ordinary test runs: set SANN_P4_MALING_DSN to a throwaway database.
 func TestSannP4GuardLatency(t *testing.T) {
-	dsn := os.Getenv("SANN_P4_MALING_DSN")
-	if dsn == "" {
-		t.Skip("SANN_P4_MALING_DSN er ikke satt")
-	}
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	db := sannP4MalingDB(t)
 	ctx := context.Background()
-	schema, err := os.ReadFile("../../../cmd/initialise/sql/08_events_table.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, stmt := range []string{"DROP SCHEMA IF EXISTS eventstore CASCADE", "CREATE SCHEMA eventstore", string(schema[:bytes.Index(schema, []byte("CREATE OR REPLACE"))]),
-		`CREATE TABLE eventstore.unique_constraints (instance_id TEXT, unique_type TEXT, unique_field TEXT, PRIMARY KEY (instance_id, unique_type, unique_field))`} {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			t.Fatal(err)
-		}
-	}
 	// Background: 2 000 other users with 100 events each, so the index is not trivially small.
 	seed(t, db, "bakgrunn-", 2000, 100)
 	sizes := []int{100, 1000, 10000, 50000, 100000}
@@ -103,6 +85,81 @@ func assertSameAsFullReplay(t *testing.T, db *sql.DB, uid string) {
 	}
 	if filtered != full || human != full.Human || owner != full.Owner {
 		t.Fatalf("%s: filtered %+v (%v, %s) differs from full %+v", uid, filtered, human, owner, full)
+	}
+}
+
+// sannP4MalingDB opens the throwaway database and recreates the upstream events2 schema.
+func sannP4MalingDB(t *testing.T) *sql.DB {
+	t.Helper()
+	dsn := os.Getenv("SANN_P4_MALING_DSN")
+	if dsn == "" {
+		t.Skip("SANN_P4_MALING_DSN er ikke satt")
+	}
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	ctx := context.Background()
+	schema, err := os.ReadFile("../../../cmd/initialise/sql/08_events_table.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{"DROP SCHEMA IF EXISTS eventstore CASCADE", "CREATE SCHEMA eventstore", string(schema[:bytes.Index(schema, []byte("CREATE OR REPLACE"))]),
+		`CREATE TABLE eventstore.unique_constraints (instance_id TEXT, unique_type TEXT, unique_field TEXT, PRIMARY KEY (instance_id, unique_type, unique_field))`} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return db
+}
+
+// A write allowed under a broken policy must wait for the user lock held by a transaction that
+// decided under the valid policy, so that decision cannot miss a concurrent state change.
+func TestSannP4PolicyErrorWaitsForUserLock(t *testing.T) {
+	db := sannP4MalingDB(t)
+	ctx := context.Background()
+	seed(t, db, "samtidig-", 1, 10)
+	path := filepath.Join(t.TempDir(), "policy.json")
+	t.Setenv("SANN_P4_POLICY", path)
+	write := func(policy string) {
+		if err := os.WriteFile(path, []byte(policy), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(`{"org":"sann","journal":"journal","finalizer":"finalizer","kart":"kart","live":"live","deletion":"deletion"}`)
+	a := &eventstore.Aggregate{ID: "samtidig-0", Type: "user", InstanceID: "instance", ResourceOwner: "sann"}
+	first, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Rollback()
+	if err := sannP4Guard(ctx, first, []eventstore.Command{user.NewHumanPasswordCheckSucceededEvent(ctx, a, nil)}); err != nil {
+		t.Fatal(err)
+	}
+	write(`{"org":`)
+	second, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Rollback()
+	done := make(chan error, 1)
+	go func() { done <- sannP4Guard(ctx, second, []eventstore.Command{user.NewUserDeactivatedEvent(ctx, a)}) }()
+	select {
+	case err := <-done:
+		t.Fatalf("write under broken policy did not wait for the user lock (err %v)", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	if err := first.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("deactivation must pass under a broken policy: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("write did not continue after the lock was released")
 	}
 }
 

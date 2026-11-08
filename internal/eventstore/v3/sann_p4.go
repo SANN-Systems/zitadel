@@ -76,11 +76,6 @@ func sannP4Guard(ctx context.Context, tx database.Tx, commands []eventstore.Comm
 				return sannP4Denied()
 			}
 		}
-		return nil
-	}
-	// An empty policy is only used during isolated bootstrap, before the person org exists.
-	if p.Org == "" {
-		return nil
 	}
 	groups := make(map[string][]eventstore.Command)
 	for _, c := range commands {
@@ -97,11 +92,20 @@ func sannP4Guard(ctx context.Context, tx database.Tx, commands []eventstore.Comm
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	actor := authz.GetCtxData(ctx).UserID
+	// Every user write takes the lock whenever a policy is configured, also under a broken policy and
+	// during bootstrap. A contact decision made under the lock can then never miss a concurrent
+	// state change, deletion marker or code rotation.
 	for _, key := range keys {
 		if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 741018))", key); err != nil {
 			return sannP4Denied()
 		}
+	}
+	// Broken policy: only unprotected writes got here. Empty policy: isolated bootstrap, before the person org exists.
+	if err != nil || p.Org == "" {
+		return nil
+	}
+	actor := authz.GetCtxData(ctx).UserID
+	for _, key := range keys {
 		cmds := groups[key]
 		a := cmds[0].Aggregate()
 		human, owner, err := sannP4Owner(ctx, tx, a.InstanceID, a.ID)

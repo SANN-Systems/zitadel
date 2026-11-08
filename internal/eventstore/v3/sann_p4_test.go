@@ -190,11 +190,13 @@ func sannP4PolicyFile(t *testing.T, content string) {
 }
 
 // A broken policy must not stop logins and other writes in the whole instance. It must still
-// stop the protected contact and journal writes, without touching the database.
+// stop the protected contact and journal writes. Allowed writes keep the user lock, so a concurrent
+// contact decision made under a valid policy cannot miss them.
 func TestSannP4InvalidPolicyOnlyDeniesProtectedWrites(t *testing.T) {
 	a := &eventstore.Aggregate{ID: "person", Type: "user", InstanceID: "instance", ResourceOwner: "sann"}
 	ctx := context.Background()
-	for name, policy := range map[string]string{"missing": "", "invalid": `{"org":`, "incomplete": `{"org":"sann","journal":"journal"}`} {
+	for name, policy := range map[string]string{"missing": "", "invalid": `{"org":`, "incomplete": `{"org":"sann","journal":"journal"}`,
+		"null": `null`, "unknown fields only": `{"organisation":"sann"}`} {
 		t.Run(name, func(t *testing.T) {
 			sannP4PolicyFile(t, policy)
 			db, mock, err := sqlmock.New()
@@ -204,6 +206,7 @@ func TestSannP4InvalidPolicyOnlyDeniesProtectedWrites(t *testing.T) {
 			defer db.Close()
 			mock.ExpectBegin()
 			tx, _ := db.Begin()
+			mock.ExpectExec("SELECT pg_advisory_xact_lock").WithArgs("instance:person").WillReturnResult(sqlmock.NewResult(0, 1))
 			if err := sannP4Guard(ctx, tx, []eventstore.Command{user.NewHumanPasswordCheckSucceededEvent(ctx, a, nil)}); err != nil {
 				t.Fatalf("login write must pass: %v", err)
 			}
@@ -304,5 +307,26 @@ func TestSannP4UpstreamTypeListIsCurrent(t *testing.T) {
 	})
 	if len(want) == 0 || !maps.Equal(want, got) {
 		t.Fatalf("sann_p4_typer_test.go is stale: upstream has %d types, list has %d", len(want), len(got))
+	}
+}
+
+// The isolated bootstrap policy `{}` writes without checks, but still serializes user writes.
+func TestSannP4BootstrapPolicyKeepsUserLock(t *testing.T) {
+	sannP4PolicyFile(t, `{}`)
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	mock.ExpectBegin()
+	tx, _ := db.Begin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WithArgs("instance:person").WillReturnResult(sqlmock.NewResult(0, 1))
+	a := &eventstore.Aggregate{ID: "person", Type: "user", InstanceID: "instance", ResourceOwner: "sann"}
+	ctx := context.Background()
+	if err := sannP4Guard(ctx, tx, []eventstore.Command{user.NewHumanEmailChangedEvent(ctx, a, "new@example.invalid")}); err != nil {
+		t.Fatalf("bootstrap write must pass: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }

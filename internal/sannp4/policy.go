@@ -1,6 +1,7 @@
 package sannp4
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,7 +19,8 @@ type Policy struct {
 }
 
 // LoadPolicy reads SANN_P4_POLICY. configured is false when the variable is unset (upstream behaviour).
-// An empty policy is the isolated bootstrap state; a policy with an org must name every identity.
+// Only a literally empty object is the isolated bootstrap state. Anything else must be a complete
+// policy without unknown fields; null, arrays and misspelled keys never switch the guard off.
 func LoadPolicy() (p Policy, configured bool, err error) {
 	path := os.Getenv("SANN_P4_POLICY")
 	if path == "" {
@@ -28,16 +30,22 @@ func LoadPolicy() (p Policy, configured bool, err error) {
 	if err != nil {
 		return p, true, fmt.Errorf("SANN_P4_POLICY: %w", err)
 	}
-	if err := json.Unmarshal(raw, &p); err != nil {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
 		return p, true, fmt.Errorf("SANN_P4_POLICY: %w", err)
 	}
-	if p.Org == "" {
-		if p != (Policy{}) {
-			return p, true, errors.New("SANN_P4_POLICY: identities without org")
-		}
+	if fields == nil {
+		return p, true, errors.New("SANN_P4_POLICY: not an object")
+	}
+	if len(fields) == 0 {
 		return p, true, nil
 	}
-	if p.Journal == "" || p.Finalizer == "" || p.Kart == "" || p.Live == "" || p.Deletion == "" {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&p); err != nil {
+		return p, true, fmt.Errorf("SANN_P4_POLICY: %w", err)
+	}
+	if p.Org == "" || p.Journal == "" || p.Finalizer == "" || p.Kart == "" || p.Live == "" || p.Deletion == "" {
 		return p, true, errors.New("SANN_P4_POLICY: incomplete policy")
 	}
 	if p.Journal == p.Finalizer {

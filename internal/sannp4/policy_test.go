@@ -20,6 +20,12 @@ func TestCheckPolicy(t *testing.T) {
 		{"incomplete", ptr(`{"org":"sann","journal":"journal"}`), false},
 		{"same journal and finalizer", ptr(`{"org":"sann","journal":"j","finalizer":"j","kart":"kart","live":"live","deletion":"deletion"}`), false},
 		{"identities without org", ptr(`{"journal":"journal"}`), false},
+		{"null", ptr(`null`), false},
+		{"array", ptr(`[]`), false},
+		{"unknown fields only", ptr(`{"organisation":"sann"}`), false},
+		{"empty org field", ptr(`{"org":""}`), false},
+		{"full with unknown field", ptr(full[:len(full)-1] + `,"extra":"x"}`), false},
+		{"trailing data", ptr(`{} {}`), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "policy.json")
