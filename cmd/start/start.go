@@ -111,6 +111,7 @@ import (
 	"github.com/zitadel/zitadel/internal/notification"
 	"github.com/zitadel/zitadel/internal/query"
 	"github.com/zitadel/zitadel/internal/queue"
+	"github.com/zitadel/zitadel/internal/sannp4"
 	"github.com/zitadel/zitadel/internal/serviceping"
 	"github.com/zitadel/zitadel/internal/static"
 	es_v4 "github.com/zitadel/zitadel/internal/v2/eventstore"
@@ -172,6 +173,10 @@ type Server struct {
 }
 
 func startZitadel(ctx context.Context, config *Config, masterKey string, server chan<- *Server) error {
+	// A configured but broken P4 policy must stop the start, not deny writes at runtime.
+	if err := sannp4.CheckPolicy(); err != nil {
+		return err
+	}
 	showBasicInformation(config)
 
 	i18n.MustLoadSupportedLanguagesFromDir()

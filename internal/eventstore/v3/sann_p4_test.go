@@ -6,8 +6,13 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/zitadel/zitadel/internal/eventstore"
 	"github.com/zitadel/zitadel/internal/repository/user"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"maps"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -34,7 +39,7 @@ func TestSannP4OrderRejectsStaleStateAndExtraWrites(t *testing.T) {
 
 func TestSannP4GuardReadsCurrentStateUnderLock(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "policy.json")
-	if err := os.WriteFile(path, []byte(`{"org":"sann","journal":"journal"}`), 0600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"org":"sann","journal":"journal","finalizer":"finalizer","kart":"kart","live":"live","deletion":"deletion"}`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("SANN_P4_POLICY", path)
@@ -46,7 +51,9 @@ func TestSannP4GuardReadsCurrentStateUnderLock(t *testing.T) {
 	mock.ExpectBegin()
 	tx, _ := db.Begin()
 	mock.ExpectExec("SELECT pg_advisory_xact_lock").WithArgs("instance:person").WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectQuery("SELECT.*event_type").WithArgs("instance", "person").WillReturnRows(
+	mock.ExpectQuery(`SELECT \(SELECT owner`).WithArgs("instance", "person").WillReturnRows(
+		sqlmock.NewRows([]string{"owner", "human"}).AddRow("sann", true))
+	mock.ExpectQuery("SELECT sequence.*event_type IN").WithArgs("instance", "person").WillReturnRows(
 		sqlmock.NewRows([]string{"sequence", "owner", "event_type", "payload", "creator"}).
 			AddRow(1, "sann", "user.human.added", []byte(`{"email":"old@example.invalid"}`), "admin"))
 	a := &eventstore.Aggregate{ID: "person", Type: "user", InstanceID: "instance", ResourceOwner: "sann"}
@@ -168,5 +175,134 @@ func TestSannP4FirstPhone(t *testing.T) {
 	s.PhoneVerified = true
 	if sannP4Allowed(p, s, "kart", "person", method, r) {
 		t.Fatal("verified phone must be protected")
+	}
+}
+
+func sannP4PolicyFile(t *testing.T, content string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "policy.json")
+	if content != "" {
+		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("SANN_P4_POLICY", path)
+}
+
+// A broken policy must not stop logins and other writes in the whole instance. It must still
+// stop the protected contact and journal writes, without touching the database.
+func TestSannP4InvalidPolicyOnlyDeniesProtectedWrites(t *testing.T) {
+	a := &eventstore.Aggregate{ID: "person", Type: "user", InstanceID: "instance", ResourceOwner: "sann"}
+	ctx := context.Background()
+	for name, policy := range map[string]string{"missing": "", "invalid": `{"org":`, "incomplete": `{"org":"sann","journal":"journal"}`} {
+		t.Run(name, func(t *testing.T) {
+			sannP4PolicyFile(t, policy)
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			mock.ExpectBegin()
+			tx, _ := db.Begin()
+			if err := sannP4Guard(ctx, tx, []eventstore.Command{user.NewHumanPasswordCheckSucceededEvent(ctx, a, nil)}); err != nil {
+				t.Fatalf("login write must pass: %v", err)
+			}
+			for _, c := range []eventstore.Command{
+				user.NewHumanEmailChangedEvent(ctx, a, "new@example.invalid"),
+				user.NewMetadataSetEvent(ctx, a, "sann.p4.journal", []byte("e30=")),
+				user.NewMetadataRemovedAllEvent(ctx, a),
+			} {
+				if err := sannP4Guard(ctx, tx, []eventstore.Command{c}); err == nil {
+					t.Fatalf("%s must be denied", c.Type())
+				}
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// Logins and other non-contact writes in the P4 org must not replay the whole history under the lock.
+func TestSannP4NonContactWriteSkipsReplay(t *testing.T) {
+	sannP4PolicyFile(t, `{"org":"sann","journal":"journal","finalizer":"finalizer","kart":"kart","live":"live","deletion":"deletion"}`)
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	mock.ExpectBegin()
+	tx, _ := db.Begin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WithArgs("instance:person").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT \(SELECT owner`).WithArgs("instance", "person").WillReturnRows(
+		sqlmock.NewRows([]string{"owner", "human"}).AddRow("sann", true))
+	a := &eventstore.Aggregate{ID: "person", Type: "user", InstanceID: "instance", ResourceOwner: "sann"}
+	ctx := context.Background()
+	if err := sannP4Guard(ctx, tx, []eventstore.Command{user.NewHumanPasswordCheckSucceededEvent(ctx, a, nil)}); err != nil {
+		t.Fatalf("login write must pass without replay: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The contact replay only reads event types the reducer uses. Every other upstream user event type
+// must leave the replayed state unchanged, so the filter cannot hide state.
+func TestSannP4ReplayFilterCoversReducer(t *testing.T) {
+	payload := []byte(`{"email":"x@example.invalid","phone":"+12025550199","key":"sann.p4.journal","value":"e30="}`)
+	for _, typ := range append(sannP4UpstreamUserTypes, "user.email.changed", "user.email.verified", "user.phone.changed", "user.phone.code.added") {
+		if sannP4Relevant(typ) {
+			continue
+		}
+		before := sannP4State{Human: true, State: "active", Email: "a@example.invalid", Phone: "+12025550100", Owner: "sann", Revision: 3, PhoneRevision: 2}
+		after := before
+		if err := after.reduce(99, "sann", typ, payload, "journal", "journal"); err != nil {
+			continue // an undecodable irrelevant payload would only fail the old full replay
+		}
+		if after != before {
+			t.Errorf("%s changes replay state but is filtered out", typ)
+		}
+	}
+}
+
+// The generated type list must follow upstream, so a new user event type cannot slip past the filter test.
+// On a Zitadel upgrade this fails until sann_p4_typer_test.go is regenerated (see the patch's drift routine).
+func TestSannP4UpstreamTypeListIsCurrent(t *testing.T) {
+	fset := token.NewFileSet()
+	want := map[string]bool{}
+	files, _ := filepath.Glob("../../repository/user/*.go")
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, f, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range file.Decls {
+			if g, ok := d.(*ast.GenDecl); ok && g.Tok == token.CONST {
+				for _, spec := range g.Specs {
+					for _, n := range spec.(*ast.ValueSpec).Names {
+						if n.IsExported() && strings.HasSuffix(n.Name, "Type") && n.Name != "AggregateType" {
+							want[n.Name] = true
+						}
+					}
+				}
+			}
+		}
+	}
+	file, err := parser.ParseFile(fset, "sann_p4_typer_test.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	ast.Inspect(file, func(n ast.Node) bool {
+		if sel, ok := n.(*ast.SelectorExpr); ok {
+			got[sel.Sel.Name] = true
+		}
+		return true
+	})
+	if len(want) == 0 || !maps.Equal(want, got) {
+		t.Fatalf("sann_p4_typer_test.go is stale: upstream has %d types, list has %d", len(want), len(got))
 	}
 }

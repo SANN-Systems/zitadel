@@ -3,10 +3,12 @@ package eventstore
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -18,14 +20,7 @@ import (
 	"github.com/zitadel/zitadel/internal/zerrors"
 )
 
-type sannP4Policy struct {
-	Org       string `json:"org"`
-	Journal   string `json:"journal"`
-	Finalizer string `json:"finalizer"`
-	Kart      string `json:"kart"`
-	Live      string `json:"live"`
-	Deletion  string `json:"deletion"`
-}
+type sannP4Policy = sannp4.Policy
 
 type sannP4State struct {
 	Human          bool
@@ -66,14 +61,22 @@ func sannP4Denied() error {
 // The hook is inside BOTH push transactions. Every user write takes the same lock, including
 // deletion, metadata and creation. Lock ordering also covers multi-user domain-policy pushes.
 func sannP4Guard(ctx context.Context, tx database.Tx, commands []eventstore.Command) error {
-	path := os.Getenv("SANN_P4_POLICY")
-	if path == "" {
+	p, configured, err := sannp4.LoadPolicy()
+	if !configured {
 		return nil
 	}
-	raw, err := os.ReadFile(path)
-	var p sannP4Policy
-	if err != nil || json.Unmarshal(raw, &p) != nil {
-		return sannP4Denied()
+	if err != nil {
+		// Startup checks the policy. A policy broken later fails closed only for protected writes,
+		// so logins and other writes in the instance keep working.
+		for _, c := range commands {
+			if c.Aggregate().Type != "user" {
+				continue
+			}
+			if contact, journal, err := sannP4Classify(c); err != nil || contact || journal {
+				return sannP4Denied()
+			}
+		}
+		return nil
 	}
 	// An empty policy is only used during isolated bootstrap, before the person org exists.
 	if p.Org == "" {
@@ -94,42 +97,36 @@ func sannP4Guard(ctx context.Context, tx database.Tx, commands []eventstore.Comm
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
+	actor := authz.GetCtxData(ctx).UserID
 	for _, key := range keys {
 		if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 741018))", key); err != nil {
 			return sannP4Denied()
 		}
 		cmds := groups[key]
 		a := cmds[0].Aggregate()
-		s, err := sannP4Read(ctx, tx, a.InstanceID, a.ID, p.Journal)
+		human, owner, err := sannP4Owner(ctx, tx, a.InstanceID, a.ID)
 		if err != nil {
 			return sannP4Denied()
 		}
-		if !s.Human || s.Owner != p.Org {
+		if !human || owner != p.Org {
 			continue
 		} // Existing humans only; never trust command owner for scoping.
-		actor := authz.GetCtxData(ctx).UserID
-		contact := false
-		phoneContact := false
+		contact, phoneContact := false, false
 		for _, c := range cmds {
-			data, err := eventstore.EventData(c)
-			if err != nil {
+			isContact, journal, err := sannP4Classify(c)
+			if err != nil || journal && (actor == "" || actor != p.Journal) {
 				return sannP4Denied()
 			}
-			var meta struct {
-				Key string `json:"key"`
-			}
-			if len(data) > 0 && json.Unmarshal(data, &meta) != nil {
-				return sannP4Denied()
-			}
-			typ := string(c.Type())
-			if (strings.HasPrefix(meta.Key, "sann.p4.") || typ == "user.metadata.removed.all") && (actor == "" || actor != p.Journal) {
-				return sannP4Denied()
-			}
-			contact = contact || sannP4Contact(typ)
-			phoneContact = phoneContact || strings.HasPrefix(typ, "user.human.phone.")
+			contact = contact || isContact
+			phoneContact = phoneContact || strings.HasPrefix(string(c.Type()), "user.human.phone.")
 		}
 		if !contact {
 			continue
+		}
+		// Only contact writes need the replayed state.
+		s, err := sannP4Read(ctx, tx, a.InstanceID, a.ID, p.Journal)
+		if err != nil {
+			return sannP4Denied()
 		}
 		r := sannp4.FromContext(ctx)
 		if sannP4OrderMatches(p, s, actor, a.ID, r.Method, r.Body) {
@@ -147,6 +144,23 @@ func sannP4Guard(ctx context.Context, tx database.Tx, commands []eventstore.Comm
 	return nil
 }
 
+// sannP4Classify reports whether a user command changes contact data, or writes the P4 journal
+// namespace (sann.p4.* metadata or removing all metadata).
+func sannP4Classify(c eventstore.Command) (contact, journal bool, err error) {
+	data, err := eventstore.EventData(c)
+	if err != nil {
+		return false, false, err
+	}
+	var meta struct {
+		Key string `json:"key"`
+	}
+	if len(data) > 0 && json.Unmarshal(data, &meta) != nil {
+		return false, false, errors.New("undecodable event data")
+	}
+	typ := string(c.Type())
+	return sannP4Contact(typ), strings.HasPrefix(meta.Key, "sann.p4.") || typ == "user.metadata.removed.all", nil
+}
+
 func sannP4Contact(typ string) bool {
 	switch typ {
 	case "user.human.email.changed", "user.human.email.verified", "user.human.phone.changed", "user.human.phone.verified", "user.human.phone.removed", "user.username.changed", "user.domain.claimed":
@@ -155,8 +169,58 @@ func sannP4Contact(typ string) bool {
 	return false
 }
 
+var sannP4HumanTypes = []string{"user.human.added", "user.human.selfregistered", "user.added", "user.selfregistered"}
+
+// sannP4ReplayTypes are the exact event types reduce reacts to. Every phone event moves PhoneRevision.
+// An explicit list (no LIKE or ranges) keeps the filter an index condition under any collation.
+var sannP4ReplayTypes = append([]string{
+	"user.human.phone.changed", "user.human.phone.removed", "user.human.phone.verified",
+	"user.human.phone.verification.failed", "user.human.phone.code.added", "user.human.phone.code.sent",
+	"user.phone.changed", "user.phone.removed", "user.phone.verified",
+	"user.phone.verification.failed", "user.phone.code.added", "user.phone.code.sent",
+	"user.human.initialization.code.added", "user.initialization.code.added",
+	"user.human.initialization.check.succeeded", "user.initialization.check.succeeded",
+	"user.human.email.changed", "user.email.changed", "user.human.email.verified", "user.email.verified",
+	"user.username.changed", "user.domain.claimed",
+	"user.deactivated", "user.locked", "user.reactivated", "user.unlocked", "user.removed",
+	"user.metadata.set", "user.metadata.removed", "user.metadata.removed.all", "user.human.invite.code.added",
+}, sannP4HumanTypes...)
+
+func sannP4Relevant(typ string) bool {
+	return slices.Contains(sannP4ReplayTypes, typ)
+}
+
+func sannP4SQLList(types []string) string {
+	return "'" + strings.Join(types, "','") + "'"
+}
+
+// The lists are constants from this file; es_wm (aggregate_id, instance_id, aggregate_type, event_type) serves both.
+var (
+	sannP4OwnerQuery = `SELECT (SELECT owner FROM eventstore.events2 WHERE instance_id=$1 AND aggregate_type='user' AND aggregate_id=$2 ORDER BY sequence DESC LIMIT 1), ` +
+		`EXISTS (SELECT 1 FROM eventstore.events2 WHERE instance_id=$1 AND aggregate_type='user' AND aggregate_id=$2 AND event_type IN (` + sannP4SQLList(sannP4HumanTypes) + `))`
+	sannP4ReplayQuery = `SELECT sequence, owner, event_type, payload, creator FROM eventstore.events2 WHERE instance_id=$1 AND aggregate_type='user' AND aggregate_id=$2 ` +
+		`AND event_type IN (` + sannP4SQLList(sannP4ReplayTypes) + `) ORDER BY sequence`
+)
+
+// sannP4Owner gives the same Human and Owner as a full replay: any human creation, and the latest owner.
+func sannP4Owner(ctx context.Context, tx database.Tx, instance, uid string) (human bool, owner string, err error) {
+	rows, err := tx.QueryContext(ctx, sannP4OwnerQuery, instance, uid)
+	if err != nil {
+		return false, "", err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return false, "", errors.Join(sql.ErrNoRows, rows.Err())
+	}
+	var o sql.NullString
+	if err := rows.Scan(&o, &human); err != nil {
+		return false, "", err
+	}
+	return human, o.String, rows.Close()
+}
+
 func sannP4Read(ctx context.Context, tx database.Tx, instance, uid, journal string) (s sannP4State, err error) {
-	rows, err := tx.QueryContext(ctx, `SELECT sequence, owner, event_type, payload, creator FROM eventstore.events2 WHERE instance_id=$1 AND aggregate_type='user' AND aggregate_id=$2 ORDER BY sequence`, instance, uid)
+	rows, err := tx.QueryContext(ctx, sannP4ReplayQuery, instance, uid)
 	if err != nil {
 		return s, err
 	}
