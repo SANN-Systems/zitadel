@@ -102,6 +102,16 @@ func TestSannP4RemovingJournalRevokesEvidence(t *testing.T) {
 	}
 }
 
+func TestSannP4DeletionMarkerTracksCurrentMetadata(t *testing.T) {
+	s := sannP4State{Deleted: true, Revision: 3}
+	if err := s.reduce(4, "sann", "user.metadata.removed", []byte(`{"key":"sann.sletting"}`), "admin", "journal"); err != nil {
+		t.Fatal(err)
+	}
+	if s.Deleted || s.Revision != 4 {
+		t.Fatal("marker removal must update current state and invalidate older orders")
+	}
+}
+
 func TestSannP4DirectEmailDenied(t *testing.T) {
 	s := sannP4State{Human: true, State: "active", Email: "old@example.invalid"}
 	r := json.RawMessage(`{"userId":"person","email":"new@example.invalid","isVerified":true}`)

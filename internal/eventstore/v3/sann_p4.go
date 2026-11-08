@@ -238,6 +238,9 @@ func (s *sannP4State) reduce(seq uint64, owner, typ string, raw []byte, creator,
 	case "user.human.invite.code.added":
 		s.OpenInvitation = true
 	case "user.metadata.removed", "user.metadata.removed.all":
+		if data.Key == "sann.sletting" || typ == "user.metadata.removed.all" {
+			s.Deleted, s.Revision = false, seq
+		}
 		if creator == journal && journal != "" && (data.Key == "sann.p4.journal" || typ == "user.metadata.removed.all") {
 			s.Journal, s.OrderRevision = sannP4Journal{}, 0
 		}
