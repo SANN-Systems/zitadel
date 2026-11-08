@@ -61,6 +61,9 @@ func (es *Eventstore) writeCommands(ctx context.Context, client database.Context
 		return nil, err
 	}
 
+	if err = sannP4Guard(ctx, tx, commands); err != nil {
+		return nil, err
+	}
 	events, err := writeEvents(ctx, tx, commands)
 	if err != nil {
 		return nil, err

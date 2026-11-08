@@ -15,6 +15,7 @@ import (
 	"github.com/zitadel/zitadel/internal/crypto"
 	"github.com/zitadel/zitadel/internal/execution"
 	target_domain "github.com/zitadel/zitadel/internal/execution/target"
+	"github.com/zitadel/zitadel/internal/sannp4"
 	"github.com/zitadel/zitadel/internal/telemetry/tracing"
 )
 
@@ -27,6 +28,11 @@ func ExecutionHandler(alg crypto.EncryptionAlgorithm, activeSigningKey execution
 			return nil, err
 		}
 
+		body, err := protojson.Marshal(handledReq.(proto.Message))
+		if err != nil {
+			return nil, err
+		}
+		ctx = sannp4.WithRequest(ctx, info.FullMethod, body)
 		response, err := handler(ctx, handledReq)
 		if err != nil {
 			return nil, err

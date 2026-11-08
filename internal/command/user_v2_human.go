@@ -10,6 +10,7 @@ import (
 	"github.com/zitadel/zitadel/internal/domain"
 	"github.com/zitadel/zitadel/internal/eventstore"
 	"github.com/zitadel/zitadel/internal/repository/user"
+	"github.com/zitadel/zitadel/internal/sannp4"
 	"github.com/zitadel/zitadel/internal/telemetry/tracing"
 	"github.com/zitadel/zitadel/internal/zerrors"
 )
@@ -389,6 +390,11 @@ func (c *Commands) ChangeUserHuman(ctx context.Context, human *ChangeHuman, alg 
 	}
 
 	if len(cmds) == 0 {
+		if human.Email != nil || human.Phone != nil || human.Username != nil {
+			if err := sannp4.RejectContactNoop(existingHuman.ResourceOwner); err != nil {
+				return err
+			}
+		}
 		human.Details = writeModelToObjectDetails(&existingHuman.WriteModel)
 		return nil
 	}

@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/zitadel/zitadel/internal/domain"
+	"github.com/zitadel/zitadel/internal/sannp4"
 )
 
 const (
@@ -84,6 +85,7 @@ func (l *Login) handleRegisterSMSCheck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := setUserContext(r.Context(), authReq.UserID, authReq.UserOrgID)
+	ctx = sannp4.WithRequest(ctx, "/sann.login.v1/FirstPhone", []byte(`{}`))
 	// save the current state
 	data := &smsInitData{Phone: formData.Phone, CountryCode: formData.CountryCode}
 

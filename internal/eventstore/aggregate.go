@@ -65,7 +65,7 @@ func AggregateFromWriteModelCtx(
 	typ AggregateType,
 	version Version,
 ) *Aggregate {
-	return NewAggregate(
+	a := NewAggregate(
 		ctx,
 		wm.AggregateID,
 		typ,
@@ -73,6 +73,8 @@ func AggregateFromWriteModelCtx(
 		WithResourceOwner(wm.ResourceOwner),
 		WithInstanceID(wm.InstanceID),
 	)
+	a.SannP4ReadSequence = wm.ProcessedSequence
+	return a
 }
 
 // Aggregate is the basic implementation of Aggregater
@@ -87,6 +89,8 @@ type Aggregate struct {
 	InstanceID string `json:"instanceId"`
 	// Version is the semver this aggregate represents
 	Version Version `json:"version"`
+	// SannP4ReadSequence binds first-phone verification to the command's write-model snapshot.
+	SannP4ReadSequence uint64 `json:"-"`
 }
 
 // AggregateType is the object name

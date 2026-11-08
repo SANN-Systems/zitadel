@@ -47,6 +47,9 @@ func (es *Eventstore) pushWithoutFunc(ctx context.Context, client database.Conte
 	var (
 		sequences []*latestSequence
 	)
+	if err = sannP4Guard(ctx, tx, commands); err != nil {
+		return nil, err
+	}
 	sequences, err = latestSequences(ctx, tx, commands)
 	if err != nil {
 		return nil, err
