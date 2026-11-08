@@ -154,8 +154,10 @@ func sannP4Classify(c eventstore.Command) (contact, journal bool, err error) {
 	var meta struct {
 		Key string `json:"key"`
 	}
-	if len(data) > 0 && json.Unmarshal(data, &meta) != nil {
-		return false, false, errors.New("undecodable event data")
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &meta); err != nil {
+			return false, false, err
+		}
 	}
 	typ := string(c.Type())
 	return sannP4Contact(typ), strings.HasPrefix(meta.Key, "sann.p4.") || typ == "user.metadata.removed.all", nil
